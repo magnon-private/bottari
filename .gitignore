@@ -1,0 +1,23 @@
+# SwiftPM / 빌드 산출물
+.build/
+build/
+*.dmg
+*.app
+DerivedData/
+.swiftpm/
+
+# Xcode
+*.xcodeproj/xcuserdata/
+xcuserdata/
+*.xcuserstate
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# 편집기 / 로컬 설정
+.idea/
+.vscode/
+.claude/settings.local.json
