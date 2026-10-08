@@ -5,8 +5,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-swift build -c release --product Bottari
-BIN="$(swift build -c release --show-bin-path)/Bottari"
+# VERSION=1.2.3  → 앱 버전 지정,  UNIVERSAL=1 → arm64 + x86_64 유니버설 빌드
+ARCH_FLAGS=()
+if [ "${UNIVERSAL:-0}" = "1" ]; then ARCH_FLAGS=(--arch arm64 --arch x86_64); fi
+swift build -c release --product Bottari ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"}
+BIN="$(swift build -c release --show-bin-path ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"})/Bottari"
 
 APP="build/Bottari.app"
 rm -rf "$APP"
@@ -14,6 +17,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Bottari"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 cp LICENSE THIRD_PARTY_LICENSES.md "$APP/Contents/Resources/"
+if [ -n "${VERSION:-}" ]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+fi
 
 ICONSET="build/AppIcon.iconset"
 rm -rf "$ICONSET"

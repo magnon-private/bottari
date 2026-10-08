@@ -1,0 +1,45 @@
+name: Release
+
+# 버전 태그(v1.2.3 형식)가 푸시될 때만 실행된다. 브랜치 푸시/PR 에서는 실행되지 않는다.
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: write   # 릴리즈 생성/파일 업로드
+
+jobs:
+  build-dmg:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 버전 결정 (태그 v1.2.3 → 1.2.3)
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: 빌드 및 DMG 생성 (유니버설, 서명 없음)
+        env:
+          UNIVERSAL: "1"
+        run: ./build.sh dmg
+
+      - name: 산출물 이름 정리 및 체크섬
+        run: |
+          mv build/Bottari.dmg "build/Bottari-${VERSION}.dmg"
+          cd build
+          shasum -a 256 "Bottari-${VERSION}.dmg" > "Bottari-${VERSION}.dmg.sha256"
+          lipo -archs Bottari.app/Contents/MacOS/Bottari
+
+      - name: 릴리즈 등록
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PRERELEASE=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then PRERELEASE="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" \
+            "build/Bottari-${VERSION}.dmg" \
+            "build/Bottari-${VERSION}.dmg.sha256" \
+            --title "Bottari ${VERSION}" \
+            --generate-notes \
+            --notes "Apple Developer 서명이 없는 빌드입니다. 처음 실행할 때 열리지 않으면 앱을 우클릭 ▸ 열기, 또는 \`xattr -dr com.apple.quarantine /Applications/Bottari.app\` 를 실행하세요." \
+            $PRERELEASE
