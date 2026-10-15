@@ -21,3 +21,4 @@ xcuserdata/
 .idea/
 .vscode/
 .claude/settings.local.json
+.gemini/

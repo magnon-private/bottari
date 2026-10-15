@@ -5,6 +5,12 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# VERSION 은 1.2.3 또는 1.2.3-beta.1 형식만 허용한다. (Info.plist 에 그대로 들어가므로)
+if [ -n "${VERSION:-}" ] && ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+    echo "잘못된 VERSION 형식: $VERSION (예: 1.2.3, 1.2.3-beta.1)" >&2
+    exit 1
+fi
+
 # VERSION=1.2.3  → 앱 버전 지정,  UNIVERSAL=1 → arm64 + x86_64 유니버설 빌드
 ARCH_FLAGS=()
 if [ "${UNIVERSAL:-0}" = "1" ]; then ARCH_FLAGS=(--arch arm64 --arch x86_64); fi

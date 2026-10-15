@@ -14,10 +14,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
         NSApp.servicesProvider = self
         NSUpdateDynamicServices()
+        sweepStaleTempDirs()
         // 파일/서비스 요청 없이 직접 실행했다면 빈 창을 보여준다.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self = self, !self.handledExternalRequest, self.controllers.isEmpty else { return }
             self.newController().showWindow(nil)
+        }
+    }
+
+    /// 강제 종료/크래시로 남은 이전 실행의 임시 폴더(Bottari-*)를 하루 이상 지난 것만 정리한다.
+    private func sweepStaleTempDirs() {
+        DispatchQueue.global(qos: .utility).async {
+            let fm = FileManager.default
+            let tmp = fm.temporaryDirectory
+            let names = (try? fm.contentsOfDirectory(atPath: tmp.path)) ?? []
+            let cutoff = Date().addingTimeInterval(-24 * 3600)
+            for name in names where name.hasPrefix("Bottari-") {
+                let url = tmp.appendingPathComponent(name)
+                let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                if let m = modified, m < cutoff { try? fm.removeItem(at: url) }
+            }
         }
     }
 

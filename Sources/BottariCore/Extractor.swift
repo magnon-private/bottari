@@ -7,21 +7,37 @@ public struct ExtractProgress {
     public var filesDone: Int
 }
 
-public struct ExtractResult {
-    public var extracted = 0
+/// 압축 해제 결과. 클래스인 이유: 도중에 실패(예: 암호 필요)해도 그때까지의 집계를 호출자가 읽을 수 있게 하기 위함.
+public final class ExtractResult {
+    public var extracted = 0         // 푼 파일(디렉토리 제외) 수
     public var skipped = 0           // 이미 존재하여 건너뜀
     public var warnings: [String] = []
+    public init() {}
+}
+
+/// 원본 압축파일의 격리(quarantine) 속성. 풀린 항목에 그대로 물려줘 Gatekeeper 검사를 유지한다.
+private let quarantineKey = "com.apple.quarantine"
+
+private func readQuarantine(_ url: URL) -> [UInt8]? {
+    let n = getxattr(url.path, quarantineKey, nil, 0, 0, 0)
+    guard n > 0 else { return nil }
+    var buf = [UInt8](repeating: 0, count: n)
+    let m = getxattr(url.path, quarantineKey, &buf, n, 0, 0)
+    return m > 0 ? Array(buf.prefix(m)) : nil
 }
 
 public enum ArchiveExtractor {
     /// - selection: nil 이면 전체. 아니면 선택한 경로(파일/디렉토리)들. 선택 항목의 상위 경로는 제거하고 풀린다.
     /// - totalBytes: 풀릴 데이터의 총량(진행률 계산용). nil 이면 읽은 압축파일 바이트 기준.
+    /// - result: 집계를 받을 객체. 생략하면 새로 만든다.
+    @discardableResult
     public static func extract(archive url: URL,
                                to destination: URL,
                                selection: [String]? = nil,
                                overwrite: Bool,
                                passphrase: String? = nil,
                                totalBytes: Int64? = nil,
+                               result: ExtractResult = ExtractResult(),
                                cancel: CancelFlag,
                                progress: @escaping (ExtractProgress) -> Void) throws -> ExtractResult {
         let fm = FileManager.default
@@ -38,7 +54,7 @@ public enum ArchiveExtractor {
             return (n, 0)
         }
 
-        let a = try makeReader(url, passphrase: passphrase)
+        let (a, rawName) = try makeReader(url, passphrase: passphrase)
         defer { archive_read_free(a) }
         guard let disk = archive_write_disk_new() else { throw ArchiveError.failed("메모리 부족") }
         defer { archive_write_free(disk) }
@@ -47,9 +63,9 @@ public enum ArchiveExtractor {
             ARCHIVE_EXTRACT_SECURE_SYMLINKS | ARCHIVE_EXTRACT_SECURE_NODOTDOT)
         archive_write_disk_set_standard_lookup(disk)
 
+        let quarantine = readQuarantine(url)
         let fileSize = (try? fm.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
         let rawIndex = max(0, archive_filter_count(a) - 1)
-        var result = ExtractResult()
         var written: Int64 = 0
         var lastReport = Date.distantPast
 
@@ -69,7 +85,16 @@ public enum ArchiveExtractor {
             let rc = archive_read_next_header(a, &entry)
             if rc == ARCHIVE_EOF { break }
             if rc < ARCHIVE_WARN { throw classify(error: errorString(a)) }
-            guard let e = entry, let item = makeEntry(e), !item.path.isEmpty else { continue }
+            guard let e = entry, let item = makeEntry(e, rawName: rawName), !item.path.isEmpty else { continue }
+
+            if item.hasUnsafePath {
+                result.warnings.append("안전하지 않은 경로를 건너뜀: \(item.path)")
+                continue
+            }
+            if item.isSpecial {
+                result.warnings.append("특수 파일(장치/FIFO/소켓)을 건너뜀: \(item.path)")
+                continue
+            }
 
             // 선택 항목 필터 + 상위 경로 제거
             var rel = item.path
@@ -115,24 +140,34 @@ public enum ArchiveExtractor {
                 continue
             }
 
-            if !item.isDirectory && item.size > 0 || item.isEncrypted {
+            // 헤더에 크기가 없는 항목(스트리밍 zip 등)도 있으므로 크기와 무관하게 읽는다.
+            // 진짜 빈 파일은 첫 호출에서 EOF 가 돌아온다.
+            if !item.isDirectory && !item.isSymlink {
                 var buff: UnsafeRawPointer?
                 var size = 0
                 var offset: Int64 = 0
-                while true {
-                    if cancel.isCancelled { throw ArchiveError.cancelled }
-                    let r = archive_read_data_block(a, &buff, &size, &offset)
-                    if r == Int(ARCHIVE_EOF) { break }
-                    if r < Int(ARCHIVE_WARN) { throw classify(error: errorString(a)) }
-                    if archive_write_data_block(disk, buff, size, offset) < Int(ARCHIVE_WARN) {
-                        throw ArchiveError.failed("\(item.path): \(errorString(disk))")
+                do {
+                    while true {
+                        if cancel.isCancelled { throw ArchiveError.cancelled }
+                        let r = archive_read_data_block(a, &buff, &size, &offset)
+                        if r == Int(ARCHIVE_EOF) { break }
+                        if r < Int(ARCHIVE_WARN) { throw classify(error: errorString(a)) }
+                        if archive_write_data_block(disk, buff, size, offset) < Int(ARCHIVE_WARN) {
+                            throw ArchiveError.failed("\(item.path): \(errorString(disk))")
+                        }
+                        written += Int64(size)
+                        report(item.path)
                     }
-                    written += Int64(size)
-                    report(item.path)
+                } catch {
+                    unlink(target)   // 쓰다 만 불완전한 파일을 남기지 않는다
+                    throw error
                 }
             }
             archive_write_finish_entry(disk)
-            result.extracted += 1
+            if let q = quarantine {
+                _ = setxattr(target, quarantineKey, q, q.count, 0, XATTR_NOFOLLOW)
+            }
+            if !item.isDirectory { result.extracted += 1 }
         }
         archive_write_close(disk)
         progress(ExtractProgress(currentPath: "", fraction: 1, filesDone: result.extracted))

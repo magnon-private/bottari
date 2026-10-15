@@ -1,24 +1,44 @@
 import Foundation
 
+extension Int64 {
+    /// 오버플로 시 Int64.max 로 포화되는 덧셈 (조작된 헤더의 거대한 크기 대비). 음수는 0 으로 본다.
+    public func saturatingAdding(_ other: Int64) -> Int64 {
+        let (r, overflow) = Swift.max(0, self).addingReportingOverflow(Swift.max(0, other))
+        return overflow ? Int64.max : r
+    }
+}
+
 public struct ArchiveEntry {
     public var path: String            // 정규화된 경로 ("./" 및 끝의 "/" 제거)
     public var isDirectory: Bool
     public var isSymlink: Bool
+    public var isSpecial: Bool         // 장치/FIFO/소켓 등 풀지 않는 종류
     public var symlinkTarget: String?
     public var size: Int64
     public var modified: Date?
     public var mode: UInt16
     public var isEncrypted: Bool
+
+    /// 목록/추출에서 제외하는 경로: ".." 포함 또는 지나치게 깊음
+    public static let maxDepth = 256
+    public var hasUnsafePath: Bool {
+        let comps = path.split(separator: "/", omittingEmptySubsequences: true)
+        return comps.count > ArchiveEntry.maxDepth || comps.contains("..")
+    }
 }
 
 public struct ArchiveListing {
     public var entries: [ArchiveEntry]
     public var formatName: String
     public var fileSize: Int64
+    /// 안전하지 않은 경로(.., 과도한 깊이)라 목록에서 뺀 항목 수
+    public var skippedEntries: Int = 0
 
     public var hasEncrypted: Bool { entries.contains { $0.isEncrypted } }
     public var fileCount: Int { entries.filter { !$0.isDirectory }.count }
-    public var totalSize: Int64 { entries.reduce(0) { $0 + ($1.isDirectory ? 0 : $1.size) } }
+    public var totalSize: Int64 {
+        entries.reduce(Int64(0)) { $0.saturatingAdding($1.isDirectory ? 0 : $1.size) }
+    }
 }
 
 public enum ArchiveError: LocalizedError {
@@ -69,8 +89,12 @@ public final class ArchiveNode {
         let root = ArchiveNode(name: "", path: "", isDirectory: true)
         var index: [String: ArchiveNode] = ["": root]
 
+        // 깊이는 maxDepth 로 제한되므로 재귀해도 안전하다.
         func ensureDir(_ path: String) -> ArchiveNode {
-            if let n = index[path] { return n }
+            if let n = index[path] {
+                if !n.isDirectory { n.isDirectory = true }   // 같은 이름의 파일 뒤에 하위 항목이 오면 폴더로 취급
+                return n
+            }
             let (parentPath, name) = split(path)
             let parent = ensureDir(parentPath)
             let node = ArchiveNode(name: name, path: path, isDirectory: true)
@@ -80,17 +104,18 @@ public final class ArchiveNode {
             return node
         }
 
-        for e in entries where !e.path.isEmpty {
+        for e in entries where !e.path.isEmpty && !e.hasUnsafePath {
             if e.isDirectory {
                 let node = ensureDir(e.path)
                 node.entry = e
             } else {
-                let (parentPath, name) = split(e.path)
-                let parent = ensureDir(parentPath)
-                if let existing = index[e.path], !existing.isDirectory {
-                    existing.entry = e   // 중복 항목은 마지막 것을 사용
+                if let existing = index[e.path] {
+                    // 중복 항목: 파일이면 마지막 것을 사용, 같은 이름의 폴더가 이미 있으면 폴더를 유지
+                    if !existing.isDirectory { existing.entry = e }
                     continue
                 }
+                let (parentPath, name) = split(e.path)
+                let parent = ensureDir(parentPath)
                 let node = ArchiveNode(name: name, path: e.path, isDirectory: false)
                 node.entry = e
                 node.parent = parent
@@ -108,11 +133,11 @@ public final class ArchiveNode {
             fileCount = 0
             for c in children {
                 c.accumulate()
-                size += c.size
+                size = size.saturatingAdding(c.size)
                 fileCount += c.isDirectory ? c.fileCount : 1
             }
         } else {
-            size = entry?.size ?? 0
+            size = max(0, entry?.size ?? 0)
         }
     }
 

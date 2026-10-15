@@ -84,8 +84,11 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
     private let promiseQueue: OperationQueue = {
         let q = OperationQueue()
         q.qualityOfService = .userInitiated
+        q.maxConcurrentOperationCount = 1   // 드래그마다 압축파일 전체를 읽으므로 동시에 하나씩만
         return q
     }()
+    private var testCancel: CancelFlag?
+    private var testPanel: ProgressPanel?
 
     private static var cascade = NSPoint.zero
     private var inArchive: Bool { archiveURL != nil && root != nil }
@@ -376,11 +379,13 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
         if sel.isEmpty {
             leftStatus.stringValue = "\(rows.count)개 개체"
         } else {
-            let total = sel.reduce(Int64(0)) { $0 + $1.size }
+            let total = sel.reduce(Int64(0)) { $0.saturatingAdding($1.size) }
             leftStatus.stringValue = "\(rows.count)개 개체 중 \(sel.count)개 선택" + (total > 0 ? "  ·  \(Fmt.size(total))" : "")
         }
         if inArchive, let l = listing {
-            rightStatus.stringValue = "\(l.formatName)  ·  파일 \(l.fileCount)개  ·  \(Fmt.size(l.totalSize)) (압축파일 \(Fmt.size(l.fileSize)))"
+            var text = "\(l.formatName)  ·  파일 \(l.fileCount)개  ·  \(Fmt.size(l.totalSize)) (압축파일 \(Fmt.size(l.fileSize)))"
+            if l.skippedEntries > 0 { text += "  ·  안전하지 않은 경로 \(l.skippedEntries)개 숨김" }
+            rightStatus.stringValue = text
         } else {
             rightStatus.stringValue = ""
         }
@@ -512,6 +517,19 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
     /// 항목을 임시 폴더에 풀어서 기본 앱으로 연다.
     private func openTemporarily(_ node: ArchiveNode) {
         guard let url = archiveURL else { return }
+        if node.entry?.isSymlink == true {
+            // 링크가 압축 폴더 밖(예: /etc)을 가리킬 수 있어 따라가 열지 않는다.
+            let alert = NSAlert()
+            alert.messageText = "심볼릭 링크는 열지 않습니다"
+            alert.informativeText = "‘\(node.name)’ → \(node.entry?.symlinkTarget ?? "?")"
+            alert.addButton(withTitle: "확인")
+            alert.beginSheetModal(for: window!)
+            return
+        }
+        if node.entry?.isEncrypted == true && (passphrase ?? "").isEmpty {
+            guard let pw = PassphrasePrompt.ask(archive: url, retry: false) else { return }
+            passphrase = pw
+        }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("Bottari-\(UUID().uuidString)", isDirectory: true)
         (NSApp.delegate as? AppDelegate)?.tempDirs.append(dir)
         let job = ExtractJob(archive: url, destination: dir, selection: [node.path], overwrite: true,
@@ -565,11 +583,15 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
 
     private func runExtract(to dest: URL, overwrite: Bool, onlySelected: Bool) {
         guard let url = archiveURL, let root = root else { return }
+        if listing?.hasEncrypted == true && (passphrase ?? "").isEmpty {
+            guard let pw = PassphrasePrompt.ask(archive: url, retry: false) else { return }
+            passphrase = pw
+        }
         let nodes = onlySelected ? selectedNodes : []
         let job = ExtractJob(archive: url, destination: dest,
                              selection: onlySelected ? nodes.map { $0.path } : nil,
                              overwrite: overwrite, passphrase: passphrase,
-                             totalBytes: onlySelected ? nodes.reduce(0) { $0 + $1.size } : root.size)
+                             totalBytes: onlySelected ? nodes.reduce(Int64(0)) { $0.saturatingAdding($1.size) } : root.size)
         job.start { [weak self] result in
             switch result {
             case .success(let r):
@@ -583,7 +605,9 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
         }
     }
 
-    @objc func testArchive(_ sender: Any?) {
+    @objc func testArchive(_ sender: Any?) { startTest(passphrase: passphrase) }
+
+    private func startTest(passphrase pw: String?) {
         guard let url = archiveURL, inArchive else { return }
         let cancel = CancelFlag()
         let panel = ProgressPanel(title: "테스트 중 — \(url.lastPathComponent)")
@@ -592,7 +616,8 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
         panel.update(text: "검사 중…", fraction: nil)
         panel.center()
         panel.makeKeyAndOrderFront(nil)
-        let pw = passphrase
+        testCancel = cancel
+        testPanel = panel
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = Result {
                 try ArchiveReader.test(url: url, passphrase: pw, cancel: cancel) { p in
@@ -600,8 +625,19 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
                 }
             }
             DispatchQueue.main.async {
+                panel.onCancel = nil
                 panel.close()
                 guard let self = self else { return }
+                self.testPanel = nil
+                self.testCancel = nil
+                if cancel.isCancelled { return }   // 사용자가 취소했거나 창이 닫힘
+
+                if case .failure(let e) = result, case ArchiveError.passphraseRequired = e,
+                   let entered = PassphrasePrompt.ask(archive: url, retry: !(pw ?? "").isEmpty) {
+                    self.passphrase = entered
+                    self.startTest(passphrase: entered)
+                    return
+                }
                 let alert = NSAlert()
                 switch result {
                 case .success(let r):
@@ -614,13 +650,12 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
                         alert.informativeText = r.failures.prefix(10).joined(separator: "\n")
                     }
                 case .failure(let e):
-                    if case ArchiveError.cancelled = e { return }
                     alert.alertStyle = .warning
                     alert.messageText = "테스트하지 못했습니다"
                     alert.informativeText = e.localizedDescription
                 }
                 alert.addButton(withTitle: "확인")
-                alert.beginSheetModal(for: self.window!)
+                if let w = self.window, w.isVisible { alert.beginSheetModal(for: w) }
             }
         }
     }
@@ -711,33 +746,42 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
 
     // MARK: - 드래그 아웃 (Finder 로 끌어서 풀기)
 
+    /// 드래그 시작 시점의 값 스냅샷. 백그라운드 큐에서 컨트롤러 상태를 읽지 않기 위함.
+    private final class DragItem {
+        let archive: URL
+        let passphrase: String?
+        let path: String
+        let name: String
+        init(archive: URL, passphrase: String?, path: String, name: String) {
+            self.archive = archive; self.passphrase = passphrase; self.path = path; self.name = name
+        }
+    }
+
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         guard row < rows.count else { return nil }
         let r = rows[row]
         if let url = r.url { return url as NSURL }
-        guard let node = r.node else { return nil }
+        guard let node = r.node, let archive = archiveURL else { return nil }
         let provider = NSFilePromiseProvider(fileType: node.isDirectory ? "public.folder" : "public.data", delegate: self)
-        provider.userInfo = node
+        provider.userInfo = DragItem(archive: archive, passphrase: passphrase, path: node.path, name: node.name)
         return provider
     }
 
     func filePromiseProvider(_ provider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
-        (provider.userInfo as? ArchiveNode)?.name ?? "item"
+        (provider.userInfo as? DragItem)?.name ?? "item"
     }
 
     func operationQueue(for provider: NSFilePromiseProvider) -> OperationQueue { promiseQueue }
 
     func filePromiseProvider(_ provider: NSFilePromiseProvider, writePromiseTo url: URL,
                              completionHandler: @escaping (Error?) -> Void) {
-        guard let node = provider.userInfo as? ArchiveNode, let archive = archiveURL else {
-            completionHandler(nil); return
-        }
+        guard let item = provider.userInfo as? DragItem else { completionHandler(nil); return }
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("Bottari-drag-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
         do {
-            _ = try ArchiveExtractor.extract(archive: archive, to: tmp, selection: [node.path], overwrite: true,
-                                             passphrase: passphrase, cancel: CancelFlag()) { _ in }
-            let src = tmp.appendingPathComponent(node.name)
+            _ = try ArchiveExtractor.extract(archive: item.archive, to: tmp, selection: [item.path], overwrite: true,
+                                             passphrase: item.passphrase, cancel: CancelFlag()) { _ in }
+            let src = tmp.appendingPathComponent(item.name)
             try? FileManager.default.removeItem(at: url)
             try FileManager.default.moveItem(at: src, to: url)
             completionHandler(nil)
@@ -749,6 +793,10 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
     // MARK: - 창
 
     func windowWillClose(_ notification: Notification) {
+        testCancel?.isCancelled = true
+        testPanel?.onCancel = nil
+        testPanel?.close()
+        testPanel = nil
         (NSApp.delegate as? AppDelegate)?.controllerClosed(self)
     }
 }

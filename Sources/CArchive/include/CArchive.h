@@ -37,6 +37,7 @@ int archive_read_free(struct archive *);
 int archive_read_close(struct archive *);
 int archive_read_support_filter_all(struct archive *);
 int archive_read_support_format_all(struct archive *);
+int archive_read_support_format_raw(struct archive *);
 int archive_read_add_passphrase(struct archive *, const char *);
 int archive_read_open_filename(struct archive *, const char *filename, size_t block_size);
 int archive_read_next_header(struct archive *, struct archive_entry **);

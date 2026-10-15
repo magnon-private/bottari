@@ -15,8 +15,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 버전 결정 (태그 v1.2.3 → 1.2.3)
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: 버전 결정 및 형식 검증 (태그 v1.2.3 → 1.2.3)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::태그 형식이 올바르지 않습니다: $GITHUB_REF_NAME (예: v1.2.3, v1.2.3-beta.1)"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: 빌드 및 DMG 생성 (유니버설, 서명 없음)
         env:

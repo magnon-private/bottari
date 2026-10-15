@@ -31,18 +31,22 @@ enum ArchiveTypes {
 }
 
 enum Icons {
-    private static var cache: [String: NSImage] = [:]
+    private static let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 256
+        return c
+    }()
 
     static func icon(ext: String, isDirectory: Bool, isLink: Bool) -> NSImage {
         let key = isDirectory ? "/dir" : (isLink ? "/link" : ext.lowercased())
-        if let c = cache[key] { return c }
+        if let c = cache.object(forKey: key as NSString) { return c }
         let type: UTType
         if isDirectory { type = .folder }
         else if isLink { type = .aliasFile }
         else { type = UTType(filenameExtension: key) ?? .data }
         let img = (NSWorkspace.shared.icon(for: type).copy() as? NSImage) ?? NSImage()
         img.size = NSSize(width: 16, height: 16)
-        cache[key] = img
+        cache.setObject(img, forKey: key as NSString)
         return img
     }
 

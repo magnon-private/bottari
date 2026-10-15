@@ -1,7 +1,6 @@
 import Foundation
 import CArchive
 
-/// 파일명 바이트열 → String. UTF-8 이 아니면 (윈도우에서 만든 zip 등) CP949 → Shift-JIS → Latin-1 순으로 시도.
 private let cp949 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
     CFStringEncoding(CFStringEncodings.dosKorean.rawValue)))
 private let cp437 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
@@ -19,6 +18,7 @@ private func repairLegacy(_ s: String) -> String {
     return s
 }
 
+/// 파일명 바이트열 → String. UTF-8 이 아니면 (윈도우에서 만든 zip 등) CP949 → Shift-JIS → Latin-1 순으로 시도.
 func decodeName(_ p: UnsafePointer<CChar>?) -> String? {
     guard let p = p else { return nil }
     let data = Data(bytes: p, count: strlen(p))
@@ -29,10 +29,11 @@ func decodeName(_ p: UnsafePointer<CChar>?) -> String? {
     return String(decoding: data, as: UTF8.self)
 }
 
+/// 빈 요소와 "." 를 제거한다. ".." 는 보존하며, 포함된 항목은 hasUnsafePath 로 걸러낸다.
 func normalizePath(_ raw: String) -> String {
-    var comps = raw.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
-    while comps.first == "." { comps.removeFirst() }
-    return comps.joined(separator: "/")
+    raw.split(separator: "/", omittingEmptySubsequences: true)
+        .filter { $0 != "." }
+        .joined(separator: "/")
 }
 
 func classify(error message: String) -> ArchiveError {
@@ -47,10 +48,13 @@ func errorString(_ a: OpaquePointer?) -> String {
     return "알 수 없는 오류"
 }
 
-func makeReader(_ url: URL, passphrase: String?) throws -> OpaquePointer {
+/// 단일 압축 스트림(foo.txt.gz 등)으로 열어볼 확장자
+private let rawExtensions: Set<String> = ["gz", "bz2", "xz", "zst", "lz", "lzma", "z"]
+
+private func openReader(_ url: URL, passphrase: String?, raw: Bool) throws -> OpaquePointer {
     guard let a = archive_read_new() else { throw ArchiveError.failed("메모리 부족") }
     archive_read_support_filter_all(a)
-    archive_read_support_format_all(a)
+    if raw { archive_read_support_format_raw(a) } else { archive_read_support_format_all(a) }
     if let p = passphrase, !p.isEmpty { archive_read_add_passphrase(a, p) }
     if archive_read_open_filename(a, url.path, 1 << 20) != ARCHIVE_OK {
         let msg = errorString(a)
@@ -60,17 +64,45 @@ func makeReader(_ url: URL, passphrase: String?) throws -> OpaquePointer {
     return a
 }
 
-func makeEntry(_ e: OpaquePointer) -> ArchiveEntry? {
-    guard let raw = decodeName(archive_entry_pathname(e)) else { return nil }
+/// tar 등이 아닌 단일 압축 파일인지: 일반 형식으로는 인식되지 않고 확장자가 압축 확장자일 때만 true
+private func isSingleCompressedStream(_ url: URL) -> Bool {
+    guard rawExtensions.contains(url.pathExtension.lowercased()) else { return false }
+    let a: OpaquePointer
+    do {
+        a = try openReader(url, passphrase: nil, raw: false)
+    } catch ArchiveError.openFailed(let msg) {
+        return msg.contains("Unrecognized")      // 열 때 이미 형식 판별에 실패하는 경우
+    } catch {
+        return false
+    }
+    defer { archive_read_free(a) }
+    var entry: OpaquePointer?
+    let rc = archive_read_next_header(a, &entry)
+    return rc < ARCHIVE_WARN && errorString(a).contains("Unrecognized")
+}
+
+/// rawName 이 있으면 단일 압축 스트림이며, 그 내용물의 이름이다. (foo.txt.gz → foo.txt)
+func makeReader(_ url: URL, passphrase: String?) throws -> (reader: OpaquePointer, rawName: String?) {
+    if isSingleCompressedStream(url) {
+        return (try openReader(url, passphrase: passphrase, raw: true), url.deletingPathExtension().lastPathComponent)
+    }
+    return (try openReader(url, passphrase: passphrase, raw: false), nil)
+}
+
+func makeEntry(_ e: OpaquePointer, rawName: String? = nil) -> ArchiveEntry? {
+    let rawPath = rawName ?? decodeName(archive_entry_pathname(e))
+    guard let raw = rawPath else { return nil }
     let type = archive_entry_filetype(e) & UInt16(ARCHIVE_AE_IFMT)
-    let isDir = type == UInt16(ARCHIVE_AE_IFDIR) || raw.hasSuffix("/")
+    let isDir = rawName == nil && (type == UInt16(ARCHIVE_AE_IFDIR) || raw.hasSuffix("/"))
     let isLink = type == UInt16(ARCHIVE_AE_IFLNK)
+    let known = [UInt16(ARCHIVE_AE_IFREG), UInt16(ARCHIVE_AE_IFDIR), UInt16(ARCHIVE_AE_IFLNK), 0]
     return ArchiveEntry(
         path: normalizePath(raw),
         isDirectory: isDir,
         isSymlink: isLink,
+        isSpecial: !known.contains(type),
         symlinkTarget: isLink ? decodeName(archive_entry_symlink(e)) : nil,
-        size: archive_entry_size_is_set(e) != 0 ? archive_entry_size(e) : 0,
+        size: archive_entry_size_is_set(e) != 0 ? max(0, archive_entry_size(e)) : 0,
         modified: archive_entry_mtime_is_set(e) != 0 ? Date(timeIntervalSince1970: TimeInterval(archive_entry_mtime(e))) : nil,
         mode: archive_entry_mode(e) & 0o7777,
         isEncrypted: archive_entry_is_data_encrypted(e) != 0
@@ -79,21 +111,24 @@ func makeEntry(_ e: OpaquePointer) -> ArchiveEntry? {
 
 public enum ArchiveReader {
     public static func list(url: URL, passphrase: String? = nil) throws -> ArchiveListing {
-        let a = try makeReader(url, passphrase: passphrase)
+        let (a, rawName) = try makeReader(url, passphrase: passphrase)
         defer { archive_read_free(a) }
 
         var entries: [ArchiveEntry] = []
+        var skipped = 0
         var entry: OpaquePointer?
         while true {
             let rc = archive_read_next_header(a, &entry)
             if rc == ARCHIVE_EOF { break }
             if rc < ARCHIVE_WARN { throw classify(error: errorString(a)) }
-            if let e = entry, let item = makeEntry(e) { entries.append(item) }
+            guard let e = entry, let item = makeEntry(e, rawName: rawName) else { continue }
+            if item.hasUnsafePath { skipped += 1; continue }
+            entries.append(item)
         }
-        let format = archive_format_name(a).map { String(cString: $0) } ?? ""
+        let format = rawName != nil ? "단일 압축 파일" : (archive_format_name(a).map { String(cString: $0) } ?? "")
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
         let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-        return ArchiveListing(entries: entries, formatName: format, fileSize: size)
+        return ArchiveListing(entries: entries, formatName: format, fileSize: size, skippedEntries: skipped)
     }
 
     public struct TestResult {
@@ -104,7 +139,7 @@ public enum ArchiveReader {
     /// 모든 데이터를 읽어 손상 여부를 검사한다.
     public static func test(url: URL, passphrase: String? = nil, cancel: CancelFlag,
                             progress: @escaping (String) -> Void) throws -> TestResult {
-        let a = try makeReader(url, passphrase: passphrase)
+        let (a, rawName) = try makeReader(url, passphrase: passphrase)
         defer { archive_read_free(a) }
 
         var result = TestResult(checkedFiles: 0, failures: [])
@@ -117,7 +152,7 @@ public enum ArchiveReader {
                 result.failures.append(errorString(a))
                 break
             }
-            guard let e = entry, let item = makeEntry(e) else { continue }
+            guard let e = entry, let item = makeEntry(e, rawName: rawName) else { continue }
             if item.isDirectory { continue }
             progress(item.path)
             var buff: UnsafeRawPointer?
