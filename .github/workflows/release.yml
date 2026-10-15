@@ -13,7 +13,8 @@ jobs:
   build-dmg:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v7
+      # 공급망 보안: 태그가 아닌 커밋 SHA 로 고정한다. 버전 갱신은 Dependabot PR 로 받는다.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: 버전 결정 및 형식 검증 (태그 v1.2.3 → 1.2.3)
         run: |

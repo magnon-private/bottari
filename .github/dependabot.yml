@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # GitHub Actions 는 커밋 SHA 로 고정되어 있으므로, 새 버전이 나오면 PR 로 SHA 갱신을 받는다.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
