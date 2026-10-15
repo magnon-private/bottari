@@ -219,6 +219,7 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
 
     /// 일반 디렉토리를 표시한다. select 가 있으면 그 항목을 선택한다.
     func browse(_ dir: URL, select: URL? = nil) {
+        cancelActiveTest()
         loadToken += 1
         isPristine = false
         fsDir = dir.standardizedFileURL
@@ -291,6 +292,7 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
     }
 
     func load(_ url: URL, passphrase: String? = nil) {
+        cancelActiveTest()
         loadToken += 1
         let token = loadToken
         isPristine = false
@@ -523,17 +525,18 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
             alert.messageText = "심볼릭 링크는 열지 않습니다"
             alert.informativeText = "‘\(node.name)’ → \(node.entry?.symlinkTarget ?? "?")"
             alert.addButton(withTitle: "확인")
-            alert.beginSheetModal(for: window!)
+            present(alert)
             return
         }
-        if node.entry?.isEncrypted == true && (passphrase ?? "").isEmpty {
-            guard let pw = PassphrasePrompt.ask(archive: url, retry: false) else { return }
-            passphrase = pw
+        var pw = passphrase
+        if node.entry?.isEncrypted == true && (pw ?? "").isEmpty {
+            guard let entered = PassphrasePrompt.ask(archive: url, retry: false) else { return }
+            pw = entered     // 작업이 성공한 뒤에만 self.passphrase 에 저장한다
         }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("Bottari-\(UUID().uuidString)", isDirectory: true)
         (NSApp.delegate as? AppDelegate)?.tempDirs.append(dir)
         let job = ExtractJob(archive: url, destination: dir, selection: [node.path], overwrite: true,
-                             passphrase: passphrase, totalBytes: node.size, showDelay: 0.6)
+                             passphrase: pw, totalBytes: node.size, ownerAccess: true, showDelay: 0.6)
         job.start { [weak self] result in
             switch result {
             case .success:
@@ -583,14 +586,17 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
 
     private func runExtract(to dest: URL, overwrite: Bool, onlySelected: Bool) {
         guard let url = archiveURL, let root = root else { return }
-        if listing?.hasEncrypted == true && (passphrase ?? "").isEmpty {
-            guard let pw = PassphrasePrompt.ask(archive: url, retry: false) else { return }
-            passphrase = pw
-        }
         let nodes = onlySelected ? selectedNodes : []
+        // 풀 대상에 암호화된 파일이 있을 때만 미리 묻는다. (선택한 항목만 푸는 경우 그 항목들만 본다)
+        var pw = passphrase
+        let needsPassword = onlySelected ? nodes.contains { $0.hasEncrypted } : (listing?.hasEncrypted == true)
+        if needsPassword && (pw ?? "").isEmpty {
+            guard let entered = PassphrasePrompt.ask(archive: url, retry: false) else { return }
+            pw = entered
+        }
         let job = ExtractJob(archive: url, destination: dest,
                              selection: onlySelected ? nodes.map { $0.path } : nil,
-                             overwrite: overwrite, passphrase: passphrase,
+                             overwrite: overwrite, passphrase: pw,
                              totalBytes: onlySelected ? nodes.reduce(Int64(0)) { $0.saturatingAdding($1.size) } : root.size)
         job.start { [weak self] result in
             switch result {
@@ -607,8 +613,23 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
 
     @objc func testArchive(_ sender: Any?) { startTest(passphrase: passphrase) }
 
+    /// 창이 보이면 시트로, 아니면 모달로 알림을 표시한다. (window 강제 언래핑 방지)
+    private func present(_ alert: NSAlert) {
+        if let w = window, w.isVisible { alert.beginSheetModal(for: w) } else { alert.runModal() }
+    }
+
+    /// 진행 중인 테스트가 있으면 취소하고 진행 패널을 닫는다.
+    private func cancelActiveTest() {
+        testCancel?.isCancelled = true
+        testPanel?.onCancel = nil
+        testPanel?.close()
+        testPanel = nil
+        testCancel = nil
+    }
+
     private func startTest(passphrase pw: String?) {
         guard let url = archiveURL, inArchive else { return }
+        cancelActiveTest()
         let cancel = CancelFlag()
         let panel = ProgressPanel(title: "테스트 중 — \(url.lastPathComponent)")
         panel.onCancel = { cancel.isCancelled = true }
@@ -676,7 +697,7 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
         암호화: \(l.hasEncrypted ? "있음" : "없음")
         """
         alert.addButton(withTitle: "확인")
-        alert.beginSheetModal(for: window!)
+        present(alert)
     }
 
     @objc func openAnother(_ sender: Any?) {
@@ -780,7 +801,7 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
         defer { try? FileManager.default.removeItem(at: tmp) }
         do {
             _ = try ArchiveExtractor.extract(archive: item.archive, to: tmp, selection: [item.path], overwrite: true,
-                                             passphrase: item.passphrase, cancel: CancelFlag()) { _ in }
+                                             passphrase: item.passphrase, ownerAccess: true, cancel: CancelFlag()) { _ in }
             let src = tmp.appendingPathComponent(item.name)
             try? FileManager.default.removeItem(at: url)
             try FileManager.default.moveItem(at: src, to: url)
@@ -793,10 +814,7 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
     // MARK: - 창
 
     func windowWillClose(_ notification: Notification) {
-        testCancel?.isCancelled = true
-        testPanel?.onCancel = nil
-        testPanel?.close()
-        testPanel = nil
+        cancelActiveTest()
         (NSApp.delegate as? AppDelegate)?.controllerClosed(self)
     }
 }

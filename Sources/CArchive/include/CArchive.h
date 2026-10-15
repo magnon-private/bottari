@@ -42,7 +42,7 @@ int archive_read_add_passphrase(struct archive *, const char *);
 int archive_read_open_filename(struct archive *, const char *filename, size_t block_size);
 int archive_read_next_header(struct archive *, struct archive_entry **);
 int archive_read_data_skip(struct archive *);
-ssize_t archive_read_data_block(struct archive *, const void **buff, size_t *len, int64_t *offset);
+int archive_read_data_block(struct archive *, const void **buff, size_t *len, int64_t *offset);
 const char *archive_error_string(struct archive *);
 const char *archive_format_name(struct archive *);
 int archive_filter_count(struct archive *);
@@ -62,6 +62,7 @@ int archive_entry_is_encrypted(struct archive_entry *);
 int archive_entry_is_data_encrypted(struct archive_entry *);
 void archive_entry_set_pathname(struct archive_entry *, const char *);
 void archive_entry_set_hardlink(struct archive_entry *, const char *);
+void archive_entry_set_perm(struct archive_entry *, mode_t);
 
 // write to disk
 struct archive *archive_write_disk_new(void);

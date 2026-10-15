@@ -1,0 +1,89 @@
+# CLAUDE.md
+
+Bottari: macOS 용 7-Zip 스타일 압축파일 관리자. Swift 5 모드 / AppKit / macOS 12+, 외부 의존성 없음.
+압축 형식 처리는 macOS 내장 `libarchive`(동적 링크). 사용자 대상 설명은 README.md, 라이선스는 LICENSE / THIRD_PARTY_LICENSES.md.
+
+## 구조
+
+| 경로 | 역할 |
+|---|---|
+| `Sources/CArchive/include/CArchive.h` | libarchive 함수·상수의 **손으로 쓴 선언**. SDK 에 `archive.h` 가 없어서 필요 |
+| `Sources/BottariCore/` | UI 와 무관한 코어. `Reader`(목록/테스트), `Extractor`(추출), `Model`(항목/트리) |
+| `Sources/Bottari/` | AppKit 앱. `ArchiveWindowController`(창·표·탐색), `AppDelegate`(메뉴·서비스), `ExtractDialog`, `ExtractJob`, `Util` |
+| `Sources/bottaricli/` | 개발·테스트용 CLI (`l`/`x`/`t`). `NO_OVERWRITE=1` 로 덮어쓰기 해제 시험 |
+| `scripts/test.sh` | 코어 회귀 테스트. `scripts/make_icon.swift` 는 아이콘 생성 |
+| `build.sh` | `.app` / `install` / `dmg` 생성. `VERSION`, `UNIVERSAL=1` 환경변수 |
+| `.github/workflows/release.yml` | `v*` 태그 푸시 시에만 유니버설 DMG 빌드 후 GitHub 릴리즈 등록 |
+
+## 명령
+
+```bash
+swift build --product Bottari      # 앱 빌드 (디버그)
+./scripts/test.sh                  # 코어 회귀 테스트 (코어를 건드렸다면 반드시 실행)
+./build.sh [install|dmg]           # 배포용 빌드. VERSION=1.2.3 UNIVERSAL=1 ./build.sh dmg
+```
+
+- 서명은 하지 않는다(ad-hoc 만). Apple Developer 계정이 없다.
+- 이 개발 머신은 Command Line Tools 만 있어 **유니버설(x86_64) 빌드가 로컬에서 실패**한다. GitHub 러너(Xcode)에서는 성공한다.
+- 릴리즈: `v1.2.3` 또는 `v1.2.3-beta.1` 형식 태그만 허용(워크플로와 `build.sh` 가 검증). 시험은 `-test` 프리릴리즈 태그로 하고 끝나면 릴리즈와 태그를 지운다.
+- Finder 서비스의 `NSPortName` 은 앱 이름(`Bottari`)과 같아야 한다. 이름을 바꾸면 `Resources/Info.plist`, 번들 ID, UTI 도 함께 바꾼다.
+
+## 반드시 지킬 것
+
+- **libarchive 선언의 시그니처를 정확히 맞춘다.** `archive_read_data_block` 은 `int` 를 반환한다. `ssize_t` 로 잘못 선언했을 때 실패값 `-25` 가 `4294967271` 로 읽혀 오류 검사가 무력화되고, 잘못된 암호/손상 데이터에서 **무한 루프**가 났다. 새 함수를 선언할 때는 반환형을 libarchive 문서로 확인하고 `scripts/test.sh` 를 돌린다. 비교는 `Int32` 상수(`ARCHIVE_EOF`, `ARCHIVE_WARN`)와 직접 한다.
+- 추출 경로는 항상 `ArchiveExtractor.safeTarget` 를 거친다. `..` 가 있거나 깊이가 `ArchiveEntry.maxDepth`(256)를 넘는 항목은 목록과 추출에서 제외한다.
+- 일반 파일은 **첫 데이터 블록을 읽은 뒤에** `archive_write_header` 를 호출한다. 그래야 암호가 틀렸을 때 기존 파일이 지워지지 않는다.
+- `overwrite == false` 이면 libarchive 플래그를 `UNLINK` 대신 `NO_OVERWRITE` 로 두고, 기존 항목과 충돌하면 **폴더끼리 합치는 경우만** 통과시킨다.
+- 크기 합산은 `Int64.saturatingAdding` 으로 한다(조작된 헤더의 오버플로 방지).
+- 백그라운드 큐에서 컨트롤러의 프로퍼티를 읽지 않는다. 드래그 아웃은 `DragItem` 값 스냅샷을 쓴다.
+- 암호는 검증되기 전에는 컨트롤러에 저장하지 않는다. 작업이 성공했을 때만 `self.passphrase` 에 반영한다.
+- `window!` 강제 언래핑 금지. 알림은 `present(_:)` 를 쓴다.
+- UI 검증 때 **키보드/마우스 이벤트를 합성하지 않는다.** 앱이 활성 상태가 아니면 다른 앱(사용자의 터미널 등)으로 입력이 간다. 화면 캡처는 전체 화면이 아니라 앱 창(`screencapture -l <windowID>`)만 찍는다.
+- `rm -rf <상대경로 glob>` 는 안전 검사에 막힌다. 시험 산출물은 새 이름의 폴더에 만든다.
+
+## 코드 리뷰 이력 (Gemini 리뷰 2회)와 판단
+
+### 수정한 것
+
+1차 리뷰
+- 크기 미지정 항목(스트리밍 zip 등)이 0바이트로 풀리던 문제 → 크기와 무관하게 데이터를 읽는다.
+- 목록 정규화가 `..` 를 처리하지 않던 문제 → `..` / 과도한 깊이 항목 제외, 상태바에 개수 표시.
+- Int64 오버플로, 깊은 경로 재귀 → 포화 연산 + 깊이 상한.
+- 압축파일 안의 파일을 열 때 격리(quarantine) 속성이 빠지던 문제 → 원본 압축파일의 `com.apple.quarantine` 을 풀린 모든 항목에 복사.
+- 드래그 아웃의 백그라운드 데이터 레이스 → 값 스냅샷 + 직렬 큐.
+- 테스트 중 창을 닫으면 `window!` 크래시 → 취소 처리, 강제 언래핑 제거.
+- 암호 재시도 시 이미 푼 파일이 "건너뜀"으로 이중 집계 → `ExtractJob` 이 보정.
+- 단일 압축 스트림(`.gz` 등)을 열지 못함 → raw 포맷 폴백.
+- 같은 경로에 파일과 폴더가 섞인 아카이브 → 폴더로 취급, 중복 이름 노드 방지.
+- 추출 취소/오류 시 불완전한 파일 잔류 → 삭제. 아이콘 캐시 → `NSCache`. 미사용 정적 프로퍼티 제거.
+- 임시 폴더 누적 → 시작 시 하루 지난 `Bottari-*` 정리. VERSION 형식 검증. CLI 인자 검사.
+
+2차 리뷰 (+ 리뷰 중 직접 발견)
+- **`archive_read_data_block` 반환형 오선언 → 잘못된 암호/손상 데이터에서 무한 루프**(리뷰에는 없던 것). 손상된 zip 의 CRC 오류도 이제 감지된다.
+- `overwrite == false` 에서 기존 파일이 폴더로 대체되던 문제 → 위 "반드시 지킬 것" 규칙.
+- 잘못된 암호 + 덮어쓰기에서 원본이 삭제될 수 있던 문제 → 첫 블록 선읽기.
+- 권한: setuid/setgid/sticky 는 복원하지 않고(`& 0o777`), 권한 정보가 없으면 644/755. 미리보기/드래그 아웃 임시 추출은 `ownerAccess` 로 소유자 접근(파일 rw, 폴더 rwx)을 보장한다. 일반 추출은 원래 권한을 유지한다.
+- 오류 시 `archive_write_finish_entry` 를 먼저 호출한 뒤 `unlink`.
+- 단일 스트림 판별: 일반 형식으로 한 번만 열고 `Unrecognized` 일 때만 raw 로 폴백. `foo.tar.gz` 이름은 폴백하지 않아 손상된 tar.gz 가 단일 파일로 보이지 않는다.
+- 테스트 취소를 `cancelActiveTest()` 로 통일(시작·폴더 이동·다른 아카이브 열기·창 닫기).
+- 검증 전 암호를 `self.passphrase` 에 넣지 않음. `ArchiveNode.hasEncrypted` 로 선택한 항목에 암호화 파일이 있을 때만 암호를 묻는다.
+- 남은 `window!` 제거. 임시 폴더 정리 기준을 수정 시각 → 생성 시각으로(미리보기 앱의 잠금 파일이 수정 시각을 바꾸므로).
+
+### 수정이 필요 없다고 확인한 것 (다시 지적받아도 근거를 먼저 볼 것)
+
+- **심볼릭 링크 타겟 검증/재작성 불필요.** 링크가 밖을 가리키는 것만으로는 해가 없고, 그 링크를 통과해 쓰는 것은 `SECURE_SYMLINKS` 가 막는다. 실제로 `lnk → 밖` 다음에 `lnk/pwn.txt` 가 오면 libarchive 가 링크를 폴더로 교체했고 밖에는 아무것도 쓰이지 않았다(`scripts/test.sh` 에 포함). 타겟을 막으면 `../` 를 쓰는 정상 아카이브(프레임워크 등)가 깨진다. 대신 UI 에서 압축 내부 심볼릭 링크를 더블클릭해도 따라가 열지 않는다.
+- **`..` 경로로 인한 선택 추출 우회는 재현되지 않음.** 선택 항목의 상위 경로를 잘라낸 뒤에도 `safeTarget` 이 `..` 를 거부하고, 잘라낸 결과가 `..` 를 포함하지 않으면 어차피 추출 폴더 안이다. (그래도 목록에서 제외하도록 보강함)
+- **SUID 복원 우려는 해당 없음.** `ARCHIVE_EXTRACT_OWNER` 를 쓰지 않아 libarchive 가 이미 제거한다(`4755` → `755` 확인). 명시적으로도 제거한다.
+- **`sweepStaleTempDirs` 가 실행 중인 폴더를 지울 위험 없음.** 시작할 때 한 번만 돌고, 그 시점에는 현재 프로세스의 임시 폴더가 아직 없다.
+- **창을 닫을 때 미리보기 임시 폴더를 지우지 않음(의도적).** 다른 앱이 그 파일을 열어 둔 채일 수 있다. 앱 종료 시 삭제 + 다음 시작 때 오래된 것 정리로 충분하다.
+- **`archive_entry_is_encrypted` 추가 확인 불필요.** 메타데이터까지 암호화된 아카이브는 목록을 열 때 이미 암호를 요구한다.
+- 비 UTF-8 심볼릭 링크 타겟은 원본 바이트 그대로 디스크에 기록되므로 다시 설정할 필요가 없다.
+- 일부 형식에서 "압축 크기" 열이 없는 것은 libarchive 가 항목별 압축 크기를 제공하지 않기 때문이다(버그 아님).
+
+### 알려진 한계
+
+- 잘못된 암호로 풀면 암호화 파일 앞에 있던 빈 폴더가 이미 만들어진 채 남을 수 있다(기존 파일은 건드리지 않음).
+- 파일과 폴더 이름이 겹치는 병적인 아카이브는 폴더로 보이고, 충돌한 쪽은 경고와 함께 건너뛴다.
+- 스트리밍(크기 미기록) zip 추출 수정은 코드 검토로만 확인했다. 해당 픽스처를 만들지 못했다.
+- 조작된 거대 크기(Int64 오버플로) 아카이브도 픽스처 없이 코드 검토로만 확인했다.
+- 단일 압축 스트림(`foo.txt.gz`)은 항목 크기를 알 수 없어 크기 열이 비어 있다.

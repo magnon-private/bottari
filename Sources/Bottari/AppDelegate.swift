@@ -31,8 +31,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let cutoff = Date().addingTimeInterval(-24 * 3600)
             for name in names where name.hasPrefix("Bottari-") {
                 let url = tmp.appendingPathComponent(name)
-                let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-                if let m = modified, m < cutoff { try? fm.removeItem(at: url) }
+                // 미리보기 앱이 폴더 안에 잠금 파일을 만들면 수정 시각이 갱신되므로 생성 시각을 기준으로 한다.
+                let created = (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate
+                if let c = created, c < cutoff { try? fm.removeItem(at: url) }
             }
         }
     }

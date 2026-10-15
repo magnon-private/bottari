@@ -24,7 +24,7 @@ do {
         dump(root, 0)
     case "x":
         guard args.count >= 4 else { usage() }
-        let r = try ArchiveExtractor.extract(archive: url, to: URL(fileURLWithPath: args[3]), overwrite: true,
+        let r = try ArchiveExtractor.extract(archive: url, to: URL(fileURLWithPath: args[3]), overwrite: ProcessInfo.processInfo.environment["NO_OVERWRITE"] == nil,
                                              passphrase: args.count > 4 ? args[4] : nil, cancel: CancelFlag()) { _ in }
         print("extracted=\(r.extracted) skipped=\(r.skipped) warnings=\(r.warnings)")
     case "t":

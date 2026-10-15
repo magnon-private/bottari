@@ -10,6 +10,7 @@ final class ExtractJob {
     let selection: [String]?
     let overwrite: Bool
     let totalBytes: Int64?
+    let ownerAccess: Bool
     var passphrase: String?
     private let showDelay: TimeInterval
     private let cancel = CancelFlag()
@@ -20,7 +21,8 @@ final class ExtractJob {
     private var completion: ((Result<ExtractResult, Error>) -> Void)?
 
     init(archive: URL, destination: URL, selection: [String]? = nil, overwrite: Bool,
-         passphrase: String?, totalBytes: Int64? = nil, showDelay: TimeInterval = 0) {
+         passphrase: String?, totalBytes: Int64? = nil, ownerAccess: Bool = false, showDelay: TimeInterval = 0) {
+        self.ownerAccess = ownerAccess
         self.archive = archive
         self.destination = destination
         self.selection = selection
@@ -48,13 +50,14 @@ final class ExtractJob {
     private func run() {
         let archive = archive, destination = destination, selection = selection
         let overwrite = overwrite, passphrase = passphrase, total = totalBytes, cancel = cancel
+        let ownerAccess = ownerAccess
         stats = ExtractResult()
         let stats = self.stats
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
                 let result = try ArchiveExtractor.extract(
                     archive: archive, to: destination, selection: selection, overwrite: overwrite,
-                    passphrase: passphrase, totalBytes: total, result: stats, cancel: cancel) { p in
+                    passphrase: passphrase, totalBytes: total, result: stats, ownerAccess: ownerAccess, cancel: cancel) { p in
                     DispatchQueue.main.async { self?.panel?.update(text: p.currentPath, fraction: p.fraction) }
                 }
                 DispatchQueue.main.async { self?.finishSuccess(result) }

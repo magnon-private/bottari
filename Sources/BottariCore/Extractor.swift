@@ -30,6 +30,8 @@ public enum ArchiveExtractor {
     /// - selection: nil 이면 전체. 아니면 선택한 경로(파일/디렉토리)들. 선택 항목의 상위 경로는 제거하고 풀린다.
     /// - totalBytes: 풀릴 데이터의 총량(진행률 계산용). nil 이면 읽은 압축파일 바이트 기준.
     /// - result: 집계를 받을 객체. 생략하면 새로 만든다.
+    /// - ownerAccess: true 면 소유자가 항상 읽고 쓸 수 있게 한다(파일 rw, 폴더 rwx). 미리보기/드래그용 임시 추출에서
+    ///   0000, 0555 같은 권한 때문에 열거나 지우지 못하는 문제를 막는다. 어느 경우든 setuid/setgid/sticky 는 복원하지 않는다.
     @discardableResult
     public static func extract(archive url: URL,
                                to destination: URL,
@@ -38,6 +40,7 @@ public enum ArchiveExtractor {
                                passphrase: String? = nil,
                                totalBytes: Int64? = nil,
                                result: ExtractResult = ExtractResult(),
+                               ownerAccess: Bool = false,
                                cancel: CancelFlag,
                                progress: @escaping (ExtractProgress) -> Void) throws -> ExtractResult {
         let fm = FileManager.default
@@ -58,8 +61,10 @@ public enum ArchiveExtractor {
         defer { archive_read_free(a) }
         guard let disk = archive_write_disk_new() else { throw ArchiveError.failed("메모리 부족") }
         defer { archive_write_free(disk) }
+        // 덮어쓰기를 끈 경우 libarchive 가 기존 항목을 지우지 못하게 한다(UNLINK 대신 NO_OVERWRITE).
         archive_write_disk_set_options(disk,
-            ARCHIVE_EXTRACT_PERM | ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_UNLINK |
+            ARCHIVE_EXTRACT_PERM | ARCHIVE_EXTRACT_TIME |
+            (overwrite ? ARCHIVE_EXTRACT_UNLINK : ARCHIVE_EXTRACT_NO_OVERWRITE) |
             ARCHIVE_EXTRACT_SECURE_SYMLINKS | ARCHIVE_EXTRACT_SECURE_NODOTDOT)
         archive_write_disk_set_standard_lookup(disk)
 
@@ -112,9 +117,13 @@ public enum ArchiveExtractor {
 
             var st = stat()
             let exists = lstat(target, &st) == 0
-            if exists && !overwrite && (st.st_mode & S_IFMT) != S_IFDIR && !item.isDirectory {
-                result.skipped += 1
-                continue
+            if exists && !overwrite {
+                let existingIsDir = (st.st_mode & S_IFMT) == S_IFDIR
+                // 기존 폴더에 같은 이름의 폴더를 합치는 경우만 허용. 파일↔폴더 충돌을 포함해 나머지는 건드리지 않는다.
+                if !(existingIsDir && item.isDirectory) {
+                    result.skipped += 1
+                    continue
+                }
             }
 
             archive_entry_set_pathname(e, target)
@@ -131,6 +140,27 @@ public enum ArchiveExtractor {
                 }
             }
 
+            if !item.isSymlink {
+                var perm = item.mode & 0o777          // setuid/setgid/sticky 제거
+                if item.mode == 0 { perm = item.isDirectory ? 0o755 : 0o644 }   // 권한 정보가 없는 항목
+                if ownerAccess { perm |= item.isDirectory ? 0o700 : 0o600 }
+                archive_entry_set_perm(e, mode_t(perm))
+            }
+
+            // 일반 파일은 첫 데이터 블록을 먼저 읽어 본다. 암호가 틀렸거나 데이터를 읽을 수 없으면
+            // 헤더를 쓰기 전에 실패하므로 기존 파일을 지우거나 빈 파일을 만들지 않는다.
+            let isRegular = !item.isDirectory && !item.isSymlink
+            var buff: UnsafeRawPointer?
+            var size = 0
+            var offset: Int64 = 0
+            var hasBlock = false
+            if isRegular {
+                let r = archive_read_data_block(a, &buff, &size, &offset)
+                if r == ARCHIVE_EOF { hasBlock = false }
+                else if r < ARCHIVE_WARN { throw classify(error: errorString(a)) }
+                else { hasBlock = true }
+            }
+
             report(item.path, force: true)
             let wr = archive_write_header(disk, e)
             if wr < ARCHIVE_WARN {
@@ -142,24 +172,22 @@ public enum ArchiveExtractor {
 
             // 헤더에 크기가 없는 항목(스트리밍 zip 등)도 있으므로 크기와 무관하게 읽는다.
             // 진짜 빈 파일은 첫 호출에서 EOF 가 돌아온다.
-            if !item.isDirectory && !item.isSymlink {
-                var buff: UnsafeRawPointer?
-                var size = 0
-                var offset: Int64 = 0
+            if isRegular {
                 do {
-                    while true {
+                    while hasBlock {
                         if cancel.isCancelled { throw ArchiveError.cancelled }
-                        let r = archive_read_data_block(a, &buff, &size, &offset)
-                        if r == Int(ARCHIVE_EOF) { break }
-                        if r < Int(ARCHIVE_WARN) { throw classify(error: errorString(a)) }
                         if archive_write_data_block(disk, buff, size, offset) < Int(ARCHIVE_WARN) {
                             throw ArchiveError.failed("\(item.path): \(errorString(disk))")
                         }
                         written += Int64(size)
                         report(item.path)
+                        let r = archive_read_data_block(a, &buff, &size, &offset)
+                        if r == ARCHIVE_EOF { break }
+                        if r < ARCHIVE_WARN { throw classify(error: errorString(a)) }
                     }
                 } catch {
-                    unlink(target)   // 쓰다 만 불완전한 파일을 남기지 않는다
+                    archive_write_finish_entry(disk)   // 열려 있던 항목을 먼저 마감한 뒤
+                    unlink(target)                      // 쓰다 만 불완전한 파일을 지운다
                     throw error
                 }
             }

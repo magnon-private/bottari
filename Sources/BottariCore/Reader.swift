@@ -48,7 +48,7 @@ func errorString(_ a: OpaquePointer?) -> String {
     return "알 수 없는 오류"
 }
 
-/// 단일 압축 스트림(foo.txt.gz 등)으로 열어볼 확장자
+/// 단일 압축 스트림(foo.txt.gz 등)으로 폴백해 볼 확장자
 private let rawExtensions: Set<String> = ["gz", "bz2", "xz", "zst", "lz", "lzma", "z"]
 
 private func openReader(_ url: URL, passphrase: String?, raw: Bool) throws -> OpaquePointer {
@@ -64,29 +64,21 @@ private func openReader(_ url: URL, passphrase: String?, raw: Bool) throws -> Op
     return a
 }
 
-/// tar 등이 아닌 단일 압축 파일인지: 일반 형식으로는 인식되지 않고 확장자가 압축 확장자일 때만 true
-private func isSingleCompressedStream(_ url: URL) -> Bool {
-    guard rawExtensions.contains(url.pathExtension.lowercased()) else { return false }
-    let a: OpaquePointer
-    do {
-        a = try openReader(url, passphrase: nil, raw: false)
-    } catch ArchiveError.openFailed(let msg) {
-        return msg.contains("Unrecognized")      // 열 때 이미 형식 판별에 실패하는 경우
-    } catch {
-        return false
-    }
-    defer { archive_read_free(a) }
-    var entry: OpaquePointer?
-    let rc = archive_read_next_header(a, &entry)
-    return rc < ARCHIVE_WARN && errorString(a).contains("Unrecognized")
+/// foo.tar.gz 처럼 tar 를 압축한 이름이면 true. 이런 파일은 raw 로 폴백하지 않는다(손상을 숨기지 않기 위해).
+private func looksLikeCompressedTar(_ url: URL) -> Bool {
+    url.deletingPathExtension().pathExtension.lowercased() == "tar"
 }
 
+/// 먼저 일반 형식으로 한 번만 열고, 형식을 인식하지 못했을 때만 단일 압축 스트림(raw)으로 폴백한다.
 /// rawName 이 있으면 단일 압축 스트림이며, 그 내용물의 이름이다. (foo.txt.gz → foo.txt)
 func makeReader(_ url: URL, passphrase: String?) throws -> (reader: OpaquePointer, rawName: String?) {
-    if isSingleCompressedStream(url) {
+    do {
+        return (try openReader(url, passphrase: passphrase, raw: false), nil)
+    } catch ArchiveError.openFailed(let msg) where msg.contains("Unrecognized")
+                                                 && rawExtensions.contains(url.pathExtension.lowercased())
+                                                 && !looksLikeCompressedTar(url) {
         return (try openReader(url, passphrase: passphrase, raw: true), url.deletingPathExtension().lastPathComponent)
     }
-    return (try openReader(url, passphrase: passphrase, raw: false), nil)
 }
 
 func makeEntry(_ e: OpaquePointer, rawName: String? = nil) -> ArchiveEntry? {
@@ -161,8 +153,8 @@ public enum ArchiveReader {
             while true {
                 if cancel.isCancelled { throw ArchiveError.cancelled }
                 let r = archive_read_data_block(a, &buff, &size, &offset)
-                if r == Int(ARCHIVE_EOF) { break }
-                if r < Int(ARCHIVE_WARN) {
+                if r == ARCHIVE_EOF { break }
+                if r < ARCHIVE_WARN {
                     let msg = errorString(a)
                     if case .passphraseRequired = classify(error: msg) { throw classify(error: msg) }
                     result.failures.append("\(item.path): \(msg)")

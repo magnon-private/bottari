@@ -78,6 +78,8 @@ public final class ArchiveNode {
     /// 파일은 자신의 크기, 디렉토리는 하위 파일 크기의 합
     public private(set) var size: Int64 = 0
     public private(set) var fileCount: Int = 0
+    /// 자신 또는 하위에 암호화된 파일이 있는지
+    public private(set) var hasEncrypted = false
 
     init(name: String, path: String, isDirectory: Bool) {
         self.name = name
@@ -131,13 +133,16 @@ public final class ArchiveNode {
         if isDirectory {
             size = 0
             fileCount = 0
+            hasEncrypted = false
             for c in children {
                 c.accumulate()
+                if c.hasEncrypted { hasEncrypted = true }
                 size = size.saturatingAdding(c.size)
                 fileCount += c.isDirectory ? c.fileCount : 1
             }
         } else {
             size = max(0, entry?.size ?? 0)
+            hasEncrypted = entry?.isEncrypted == true
         }
     }
 
