@@ -69,16 +69,39 @@ private func looksLikeCompressedTar(_ url: URL) -> Bool {
     url.deletingPathExtension().pathExtension.lowercased() == "tar"
 }
 
-/// 먼저 일반 형식으로 한 번만 열고, 형식을 인식하지 못했을 때만 단일 압축 스트림(raw)으로 폴백한다.
+/// 단일 압축 스트림(foo.txt.gz 등)으로 취급할 수 있는 이름인지
+private func isRawCandidate(_ url: URL) -> Bool {
+    rawExtensions.contains(url.pathExtension.lowercased()) && !looksLikeCompressedTar(url)
+}
+
+/// 압축을 푼 내용이 0바이트인 파일은 libarchive 가 "Empty file" 형식(항목 0개)으로 인식해 raw 폴백이 일어나지 않는다.
+private func decompressesToNothing(_ url: URL, passphrase: String?) -> Bool {
+    guard let a = try? openReader(url, passphrase: passphrase, raw: false) else { return false }
+    defer { archive_read_free(a) }
+    var entry: OpaquePointer?
+    guard archive_read_next_header(a, &entry) == ARCHIVE_EOF, let name = archive_format_name(a) else { return false }
+    return String(cString: name).lowercased().contains("empty")
+}
+
+/// 먼저 일반 형식으로 열고, 형식을 인식하지 못했거나(또는 내용이 비어 있을 때) 단일 압축 스트림(raw)으로 폴백한다.
 /// rawName 이 있으면 단일 압축 스트림이며, 그 내용물의 이름이다. (foo.txt.gz → foo.txt)
 func makeReader(_ url: URL, passphrase: String?) throws -> (reader: OpaquePointer, rawName: String?) {
+    let rawName = url.deletingPathExtension().lastPathComponent
+    if isRawCandidate(url), decompressesToNothing(url, passphrase: passphrase) {
+        // raw 형식도 빈 스트림은 읽지 못한다. 항목이 없는 리더를 돌려주고, 호출자가 빈 파일 하나로 취급한다.
+        return (try openReader(url, passphrase: passphrase, raw: false), rawName)
+    }
     do {
         return (try openReader(url, passphrase: passphrase, raw: false), nil)
-    } catch ArchiveError.openFailed(let msg) where msg.contains("Unrecognized")
-                                                 && rawExtensions.contains(url.pathExtension.lowercased())
-                                                 && !looksLikeCompressedTar(url) {
-        return (try openReader(url, passphrase: passphrase, raw: true), url.deletingPathExtension().lastPathComponent)
+    } catch ArchiveError.openFailed(let msg) where msg.contains("Unrecognized") && isRawCandidate(url) {
+        return (try openReader(url, passphrase: passphrase, raw: true), rawName)
     }
+}
+
+/// 0바이트 파일 하나를 나타내는 가상 항목 (빈 foo.txt.gz 의 내용물)
+func emptyFileEntry(_ name: String) -> ArchiveEntry {
+    ArchiveEntry(path: name, isDirectory: false, isSymlink: false, isSpecial: false, symlinkTarget: nil,
+                 size: 0, modified: nil, mode: 0o644, isEncrypted: false)
 }
 
 func makeEntry(_ e: OpaquePointer, rawName: String? = nil) -> ArchiveEntry? {
@@ -117,6 +140,9 @@ public enum ArchiveReader {
             if item.hasUnsafePath { skipped += 1; continue }
             entries.append(item)
         }
+        if let name = rawName, entries.isEmpty, skipped == 0 {     // 내용이 0바이트인 단일 압축 파일
+            entries.append(emptyFileEntry(name))
+        }
         let format = rawName != nil ? "단일 압축 파일" : (archive_format_name(a).map { String(cString: $0) } ?? "")
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
         let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
@@ -135,6 +161,7 @@ public enum ArchiveReader {
         defer { archive_read_free(a) }
 
         var result = TestResult(checkedFiles: 0, failures: [])
+        var sawHeader = false
         var entry: OpaquePointer?
         while true {
             if cancel.isCancelled { throw ArchiveError.cancelled }
@@ -144,6 +171,7 @@ public enum ArchiveReader {
                 result.failures.append(errorString(a))
                 break
             }
+            sawHeader = true
             guard let e = entry, let item = makeEntry(e, rawName: rawName) else { continue }
             if item.isDirectory { continue }
             progress(item.path)
@@ -163,6 +191,7 @@ public enum ArchiveReader {
             }
             result.checkedFiles += 1
         }
+        if rawName != nil && !sawHeader { result.checkedFiles = 1 }    // 빈 단일 압축 파일
         return result
     }
 }

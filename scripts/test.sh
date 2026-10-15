@@ -32,6 +32,14 @@ with tarfile.open('dirvsfile.tar', 'w') as t:
 with tarfile.open('perm.tar', 'w') as t:
     add(t, 'suid', b'x', mode=0o4755); add(t, 'zero', b'z', mode=0)
 PY
+python3 -I - <<'PY'
+import tarfile, io
+def add(t, name, data=b'', mode=0o644):
+    i = tarfile.TarInfo(name); i.mode = mode; i.size = len(data); t.addfile(i, io.BytesIO(data))
+with tarfile.open('q.tar', 'w') as t:      # 디렉토리 엔트리 없음 (zip 의 .app 처럼)
+    add(t, 'Foo.app/Contents/MacOS/Foo', b'bin', 0o555); add(t, 'ro.txt', b'ro', 0o444)
+PY
+: | gzip -c > empty.txt.gz
 mkdir outside; printf 'hello raw\n' > one.txt; gzip -c one.txt > one.txt.gz
 
 echo "== 기본"
@@ -61,5 +69,15 @@ mkdir c2 && echo OLD > c2/suid; NO_OVERWRITE=1 run x perm.tar c2 >/dev/null; [ "
 echo "== 격리 속성"
 xattr -w com.apple.quarantine "0083;5f000000;Safari;ABCD" t.zip; run x t.zip q1 >/dev/null
 xattr -p com.apple.quarantine q1/src/a.txt >/dev/null 2>&1; check "quarantine 속성 전달" $?
+
+echo "== 격리 속성: 읽기 전용 파일 / 암묵적 상위 폴더"
+xattr -w com.apple.quarantine "0083;5f000000;Safari;ABCD" q.tar; mkdir pre; mkdir pre/Foo.app; run x q.tar q2 >/dev/null; run x q.tar pre >/dev/null
+xattr -p com.apple.quarantine q2/ro.txt >/dev/null 2>&1 && xattr -p com.apple.quarantine q2/Foo.app/Contents/MacOS/Foo >/dev/null 2>&1; check "0444/0555 파일에도 속성 전달" $?
+xattr -p com.apple.quarantine q2/Foo.app >/dev/null 2>&1; check "암묵적으로 만들어진 .app 폴더에도 속성 전달" $?
+! xattr -p com.apple.quarantine pre/Foo.app >/dev/null 2>&1; check "원래 있던 폴더에는 속성을 붙이지 않음" $?
+[ "$(/usr/bin/stat -f %Lp q2/Foo.app/Contents/MacOS/Foo)" = 555 ]; check "원래 권한(0555) 유지" $?
+
+echo "== 빈 단일 압축 파일"
+run x empty.txt.gz em >/dev/null; [ -f em/empty.txt ] && [ ! -s em/empty.txt ]; check "빈 .gz 가 0바이트 파일로 풀림" $?
 
 echo; echo "통과 $pass, 실패 $fail"; [ "$fail" -eq 0 ]

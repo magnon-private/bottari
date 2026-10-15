@@ -73,6 +73,9 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
     private var rows: [Row] = []
     private var passphrase: String?
     private var loadToken = 0
+    private var pendingURL: URL?          // 로딩 중인 압축파일
+    /// 열려 있거나 열리는 중인 압축파일 (표준화된 경로)
+    var openedOrPendingURL: URL? { pendingURL ?? archiveURL }
     /// 아직 아무것도 열지/탐색하지 않은 처음 상태 (Finder 에서 열 때 재사용)
     private(set) var isPristine = true
 
@@ -221,6 +224,7 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
     func browse(_ dir: URL, select: URL? = nil) {
         cancelActiveTest()
         loadToken += 1
+        pendingURL = nil
         isPristine = false
         fsDir = dir.standardizedFileURL
         archiveURL = nil
@@ -271,7 +275,7 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
             return Row(name: n.name, isDirectory: n.isDirectory, size: n.size, modified: n.entry?.modified,
                        attr: Fmt.attributes(mode: n.entry?.mode ?? 0, isDirectory: n.isDirectory, isSymlink: link),
                        kind: Icons.kind(ext: ext, isDirectory: n.isDirectory, isLink: link),
-                       encrypted: n.entry?.isEncrypted == true, node: n, url: nil,
+                       encrypted: n.hasEncrypted, node: n, url: nil,
                        icon: Icons.icon(ext: ext, isDirectory: n.isDirectory, isLink: link))
         }
     }
@@ -295,6 +299,8 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
         cancelActiveTest()
         loadToken += 1
         let token = loadToken
+        let url = url.standardizedFileURL
+        pendingURL = url
         isPristine = false
         leftStatus.stringValue = "여는 중…"
         rightStatus.stringValue = ""
@@ -302,6 +308,7 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
             let result = Result { try ArchiveReader.list(url: url, passphrase: passphrase) }
             DispatchQueue.main.async {
                 guard let self = self, token == self.loadToken else { return }
+                self.pendingURL = nil
                 switch result {
                 case .success(let l):
                     self.archiveURL = url
@@ -783,6 +790,11 @@ final class ArchiveWindowController: NSWindowController, NSWindowDelegate, NSTab
         let r = rows[row]
         if let url = r.url { return url as NSURL }
         guard let node = r.node, let archive = archiveURL else { return nil }
+        if node.hasEncrypted && (passphrase ?? "").isEmpty {
+            // 드래그 도중에는 암호를 물을 수 없으므로 시작하지 않고 안내한다.
+            leftStatus.stringValue = "암호가 필요한 항목입니다. 먼저 항목을 열거나 압축 풀기(⌘E)로 암호를 입력하세요."
+            return nil
+        }
         let provider = NSFilePromiseProvider(fileType: node.isDirectory ? "public.folder" : "public.data", delegate: self)
         provider.userInfo = DragItem(archive: archive, passphrase: passphrase, path: node.path, name: node.name)
         return provider

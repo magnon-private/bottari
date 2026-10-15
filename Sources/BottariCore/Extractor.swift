@@ -26,6 +26,30 @@ private func readQuarantine(_ url: URL) -> [UInt8]? {
     return m > 0 ? Array(buf.prefix(m)) : nil
 }
 
+/// 격리 속성을 붙인다. 읽기 전용(0444/0555 등) 항목은 xattr 쓰기가 EACCES 로 실패하므로
+/// 잠시 소유자 쓰기 권한을 주고 붙인 뒤 원래 모드로 되돌린다.
+private func applyQuarantine(_ path: String, _ value: [UInt8]) {
+    if setxattr(path, quarantineKey, value, value.count, 0, XATTR_NOFOLLOW) == 0 { return }
+    guard errno == EACCES else { return }
+    var st = stat()
+    guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) != S_IFLNK else { return }
+    let mode = st.st_mode & 0o7777
+    chmod(path, mode | 0o200)
+    _ = setxattr(path, quarantineKey, value, value.count, 0, XATTR_NOFOLLOW)
+    chmod(path, mode)
+}
+
+/// root 아래에서 target 의 상위 폴더들 (가까운 것부터)
+private func ancestors(of target: String, root: String) -> [String] {
+    var result: [String] = []
+    var p = (target as NSString).deletingLastPathComponent
+    while p.count > root.count && p.hasPrefix(root + "/") {
+        result.append(p)
+        p = (p as NSString).deletingLastPathComponent
+    }
+    return result
+}
+
 public enum ArchiveExtractor {
     /// - selection: nil 이면 전체. 아니면 선택한 경로(파일/디렉토리)들. 선택 항목의 상위 경로는 제거하고 풀린다.
     /// - totalBytes: 풀릴 데이터의 총량(진행률 계산용). nil 이면 읽은 압축파일 바이트 기준.
@@ -69,6 +93,10 @@ public enum ArchiveExtractor {
         archive_write_disk_set_standard_lookup(disk)
 
         let quarantine = readQuarantine(url)
+        // 상위 폴더(예: 디렉토리 엔트리 없이 풀리는 Foo.app)에도 격리 속성이 필요하다.
+        // 이번 추출에서 새로 만든 폴더만 대상으로 한다. (사용자가 원래 갖고 있던 폴더에는 붙이지 않음)
+        var createdDirs: [String: Bool] = [:]
+        var taggedDirs = Set<String>()
         let fileSize = (try? fm.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
         let rawIndex = max(0, archive_filter_count(a) - 1)
         var written: Int64 = 0
@@ -85,11 +113,13 @@ public enum ArchiveExtractor {
         }
 
         var entry: OpaquePointer?
+        var sawHeader = false
         while true {
             if cancel.isCancelled { throw ArchiveError.cancelled }
             let rc = archive_read_next_header(a, &entry)
             if rc == ARCHIVE_EOF { break }
             if rc < ARCHIVE_WARN { throw classify(error: errorString(a)) }
+            sawHeader = true
             guard let e = entry, let item = makeEntry(e, rawName: rawName), !item.path.isEmpty else { continue }
 
             if item.hasUnsafePath {
@@ -111,10 +141,6 @@ public enum ArchiveExtractor {
                 result.warnings.append("안전하지 않은 경로를 건너뜀: \(item.path)")
                 continue
             }
-            if item.isEncrypted && (passphrase ?? "").isEmpty && !item.isDirectory {
-                throw ArchiveError.passphraseRequired("암호가 필요합니다.")
-            }
-
             var st = stat()
             let exists = lstat(target, &st) == 0
             if exists && !overwrite {
@@ -125,6 +151,15 @@ public enum ArchiveExtractor {
                     continue
                 }
             }
+
+            if item.isEncrypted && (passphrase ?? "").isEmpty && !item.isDirectory {
+                throw ArchiveError.passphraseRequired("암호가 필요합니다.")
+            }
+
+            for dir in ancestors(of: target, root: root) where createdDirs[dir] == nil {
+                createdDirs[dir] = lstat(dir, &st) != 0     // 아직 없으면 이번에 libarchive 가 만든다
+            }
+            if item.isDirectory && createdDirs[target] == nil { createdDirs[target] = !exists }
 
             archive_entry_set_pathname(e, target)
             if let hl = archive_entry_hardlink(e), let h = decodeName(hl) {
@@ -191,13 +226,37 @@ public enum ArchiveExtractor {
                     throw error
                 }
             }
-            archive_write_finish_entry(disk)
+            let fr = archive_write_finish_entry(disk)
+            if fr < ARCHIVE_WARN {                       // 디스크 풀(ENOSPC) 등 마감 시점의 오류
+                if isRegular { unlink(target) }
+                throw ArchiveError.failed("\(item.path): \(errorString(disk))")
+            }
             if let q = quarantine {
-                _ = setxattr(target, quarantineKey, q, q.count, 0, XATTR_NOFOLLOW)
+                if !item.isDirectory || createdDirs[target] == true { applyQuarantine(target, q) }
+                for dir in ancestors(of: target, root: root) where createdDirs[dir] == true && !taggedDirs.contains(dir) {
+                    applyQuarantine(dir, q)
+                    taggedDirs.insert(dir)
+                }
             }
             if !item.isDirectory { result.extracted += 1 }
         }
-        archive_write_close(disk)
+        // 내용이 0바이트인 단일 압축 파일(빈 foo.txt.gz): 항목이 없으므로 빈 파일을 직접 만든다.
+        if let name = rawName, !sawHeader,
+           picks == nil || picks!.contains(where: { $0.path == normalizePath(name) }),
+           let target = safeTarget(root: root, relative: name) {
+            var st = stat()
+            if lstat(target, &st) == 0 && !overwrite {
+                result.skipped += 1
+            } else if FileManager.default.createFile(atPath: target, contents: Data()) {
+                if let q = quarantine { applyQuarantine(target, q) }
+                result.extracted += 1
+            } else {
+                throw ArchiveError.failed("\(name): 파일을 만들 수 없습니다")
+            }
+        }
+        if archive_write_close(disk) < ARCHIVE_WARN {      // 지연된 폴더 메타데이터 반영 단계의 오류
+            throw ArchiveError.failed(errorString(disk))
+        }
         progress(ExtractProgress(currentPath: "", fraction: 1, filesDone: result.extracted))
         return result
     }

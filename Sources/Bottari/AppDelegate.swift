@@ -68,7 +68,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func openArchive(_ url: URL) {
-        if let existing = controllers.first(where: { $0.archiveURL == url }) {
+        if let existing = controllers.first(where: { $0.openedOrPendingURL == url.standardizedFileURL }) {
             existing.showWindow(nil)
             return
         }
