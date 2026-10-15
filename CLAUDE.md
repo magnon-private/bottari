@@ -23,6 +23,7 @@ swift build --product Bottari      # 앱 빌드 (디버그)
 ./build.sh [install|dmg]           # 배포용 빌드. VERSION=1.2.3 UNIVERSAL=1 ./build.sh dmg
 ```
 
+- 앱 버전: `VERSION` 이 없으면 `git describe` 로 정한다(`v0.0.3` → `0.0.3`, 태그 이후 커밋/수정이 있으면 `0.0.3-2-gabc1234`, `-dirty`). 빌드 번호는 `BUILD_NUMBER`(CI 는 run 번호) 또는 커밋 수. `Info.plist` 의 값은 git 없이 빌드할 때의 자리표시자(0.0.0)다.
 - 서명은 하지 않는다(ad-hoc 만). Apple Developer 계정이 없다.
 - 이 개발 머신은 Command Line Tools 만 있어 **유니버설(x86_64) 빌드가 로컬에서 실패**한다. GitHub 러너(Xcode)에서는 성공한다.
 - 릴리즈: `v1.2.3` 또는 `v1.2.3-beta.1` 형식 태그만 허용(워크플로와 `build.sh` 가 검증). 시험은 `-test` 프리릴리즈 태그로 하고 끝나면 릴리즈와 태그를 지운다.

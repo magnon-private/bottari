@@ -5,6 +5,16 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# VERSION 을 주지 않으면 git 태그에서 가져온다. (v0.0.3 → 0.0.3, 태그 이후 커밋이 있으면 0.0.3-2-gabc1234)
+if [ -z "${VERSION:-}" ] && command -v git >/dev/null 2>&1; then
+    DESCRIBED="$(git describe --tags --match 'v[0-9]*' --dirty=-dirty 2>/dev/null || true)"
+    if [ -n "$DESCRIBED" ]; then VERSION="${DESCRIBED#v}"; fi
+fi
+# 빌드 번호: BUILD_NUMBER 환경변수(CI 는 run 번호), 없으면 git 커밋 수
+if [ -z "${BUILD_NUMBER:-}" ] && command -v git >/dev/null 2>&1; then
+    BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || true)"
+fi
+
 # VERSION 은 1.2.3 또는 1.2.3-beta.1 형식만 허용한다. (Info.plist 에 그대로 들어가므로)
 if [ -n "${VERSION:-}" ] && ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
     echo "잘못된 VERSION 형식: $VERSION (예: 1.2.3, 1.2.3-beta.1)" >&2
@@ -24,7 +34,10 @@ cp "$BIN" "$APP/Contents/MacOS/Bottari"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 cp LICENSE THIRD_PARTY_LICENSES.md "$APP/Contents/Resources/"
 if [ -n "${VERSION:-}" ]; then
-    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+fi
+if [[ "${BUILD_NUMBER:-}" =~ ^[0-9]+$ ]]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP/Contents/Info.plist"
 fi
 
 ICONSET="build/AppIcon.iconset"

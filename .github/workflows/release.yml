@@ -27,6 +27,7 @@ jobs:
       - name: 빌드 및 DMG 생성 (유니버설, 서명 없음)
         env:
           UNIVERSAL: "1"
+          BUILD_NUMBER: ${{ github.run_number }}
         run: ./build.sh dmg
 
       - name: 산출물 이름 정리 및 체크섬
